@@ -1,0 +1,101 @@
+/* =========================================================
+   СЕРВЕРНАЯ ЧАСТЬ (РЕЕСТР ТЭГОВ И ОЧЕРЕДЬ СООБЩЕНИЙ)
+   Запуск: node server.js
+   ========================================================= */
+const WebSocket = require('ws');
+const fs = require('fs');
+
+const PORT = process.env.PORT || 8080;
+
+// Хранилище в памяти (для продакшена лучше использовать SQLite)
+const clients = new Map(); // tag -> ws
+let offlineQueue = {};     // tag -> массив сообщений
+let registry = {};         // tag -> publicKey
+
+// Загружаем сохраненные данные, если они есть
+try { offlineQueue = JSON.parse(fs.readFileSync('./queue.json', 'utf8')); } catch (e) {}
+try { registry = JSON.parse(fs.readFileSync('./registry.json', 'utf8')); } catch (e) {}
+
+const saveQueue = () => fs.writeFileSync('./queue.json', JSON.stringify(offlineQueue));
+const saveRegistry = () => fs.writeFileSync('./registry.json', JSON.stringify(registry));
+
+// Функции для работы с офлайн-очередью
+function enqueue(toTag, msg) {
+  if (!offlineQueue[toTag]) offlineQueue[toTag] = [];
+  offlineQueue[toTag].push(msg);
+  saveQueue();
+}
+
+function flushQueue(toTag, ws) {
+  const pending = offlineQueue[toTag] || [];
+  if (!pending.length) return;
+  pending.forEach(m => ws.send(JSON.stringify(m)));
+  offlineQueue[toTag] = [];
+  saveQueue();
+}
+
+// Запускаем WebSocket сервер
+const wss = new WebSocket.Server({ port: PORT });
+
+wss.on('connection', (ws) => {
+  console.log('Новое подключение');
+
+  ws.on('message', (raw) => {
+    let msg;
+    try { msg = JSON.parse(raw); } catch (e) { return; }
+
+    // 1. Регистрация тэга и ключа при подключении
+    if (msg.type === 'publish' || msg.type === 'register') {
+      if (msg.tag && msg.publicKey) {
+        registry[msg.tag] = msg.publicKey;
+        saveRegistry();
+      }
+      if (msg.tag) {
+        clients.set(msg.tag, ws);
+        ws.tag = msg.tag;
+        flushQueue(msg.tag, ws); // Отдаем накопленные сообщения
+        console.log(`Пользователь онлайн: ${msg.tag}`);
+      }
+      return;
+    }
+
+    // 2. Поиск друга по тэгу
+    if (msg.type === 'lookup') {
+      const pub = registry[msg.tag] || null;
+      ws.send(JSON.stringify({ type: 'lookup-result', tag: msg.tag, publicKey: pub }));
+      return;
+    }
+
+    // 3. Пересылка текста и фото
+    if (msg.type === 'msg') {
+      if (clients.has(msg.to)) {
+        clients.get(msg.to).send(JSON.stringify(msg));
+      } else {
+        enqueue(msg.to, { ...msg, id: Date.now() + '_' + Math.random() });
+      }
+      return;
+    }
+
+    // 4. Сигналы для звонков (WebRTC)
+    if (['call-offer', 'call-answer', 'call-ice', 'call-end'].includes(msg.type)) {
+      if (clients.has(msg.to)) clients.get(msg.to).send(JSON.stringify(msg));
+      return;
+    }
+
+    // 5. Жалобы
+    if (msg.type === 'report') {
+      console.log('ЖАЛОБА:', msg.from, '→', msg.about);
+      return;
+    }
+  });
+
+  ws.on('close', () => {
+    if (ws.tag) {
+      clients.delete(ws.tag);
+      console.log(`Пользователь офлайн: ${ws.tag}`);
+    }
+  });
+});
+
+console.log(`\n✅ Сервер запущен на порту ${PORT}`);
+console.log(`👥 В реестре тэгов: ${Object.keys(registry).length}\n`);
